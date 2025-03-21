@@ -55,12 +55,12 @@ def graph_connections(D_x, D_y, R, H, grid_size=20, connection_radius=2):
 
     # Create PyTorch Geometric Data object
     graph_data = Data(x=node_features, edge_index=edge_index)
+    print(f"Graph has {graph_data.num_edges} edges.")
 
     return graph_data
 
 
-
-grid_size = 20
+grid_size = 100
 
 # Process all .mat files
 for file_name in mat_files:
@@ -73,7 +73,7 @@ for file_name in mat_files:
     for var in metadata:
         variable_names.append(var[0])
 
-    required_vars = ["D", "R", "H"]
+    required_vars = ["D", "R", "H", "Ex", "Ey", "Ez"]
     loaded_data = {}
     for var in required_vars:
         loaded_data[var] = scipy.io.loadmat(file_path, variable_names=[var])[var]
@@ -82,16 +82,33 @@ for file_name in mat_files:
     R = loaded_data["R"]
     H = loaded_data["H"]
 
+    Ex = loaded_data["Ex"]
+    Ey = loaded_data["Ey"]
+    Ez = loaded_data["Ez"]
+
     # Convert to correct dimensions
     D_x = D[0, :grid_size, :grid_size].flatten()
     D_y = D[1, :grid_size, :grid_size].flatten()
     R = R[:grid_size, :grid_size].flatten()
     H = H[:grid_size, :grid_size].flatten()
+    Ex = loaded_data["Ex"][:grid_size, :grid_size]
+    Ey = loaded_data["Ey"][:grid_size, :grid_size]
+    Ez = loaded_data["Ez"][:grid_size, :grid_size]
 
     # Call the function to get graph data and connections
     py_graph = graph_connections(D_x, D_y, R, H, grid_size)
 
+
+    # Stack field components into shape [6, grid_size, grid_size]
+    field_tensor = np.stack([
+        np.real(Ex), np.imag(Ex),
+        np.real(Ey), np.imag(Ey),
+        np.real(Ez), np.imag(Ez)
+    ], axis=0)
+    field_tensor = torch.tensor(field_tensor, dtype=torch.float32)
+
     # Save graph data as a .pt (pytorch) file
+    py_graph.y = field_tensor
     output_filename = file_name.replace(".mat", ".pt")
     torch.save(py_graph, os.path.join(data_folder, output_filename))
     
