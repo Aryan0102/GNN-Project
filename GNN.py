@@ -3,119 +3,99 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import NNConv
+from torch_geometric.data import Data
 import matplotlib.pyplot as plt
+from torch.serialization import safe_globals
 
-# Model Definition
 class GNN(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=64, output_channels=6):
+    def __init__(self, input_dim=6, hidden_dim=64, conv_channels=64, output_channels=6, grid_size=9):
         super(GNN, self).__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, hidden_dim)
-        self.cnn = nn.Sequential(
-            nn.Conv2d(hidden_dim, 32, kernel_size=3, padding=1),
+        self.grid_size = grid_size
+
+        # used to compute edge-conditioned weight matrices for NNConv
+        nn_edge = nn.Sequential(
+            nn.Linear(1, 64),
             nn.ReLU(),
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 8, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(8, output_channels, kernel_size=3, padding=1)
+            nn.Linear(64, input_dim * output_channels)
         )
 
-    def forward(self, data, grid_size):
-        x = data.x
-        edge_index = data.edge_index
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
-        x = F.relu(self.conv3(x, edge_index))
-        x = x.view(1, grid_size, grid_size, -1).permute(0, 3, 1, 2) # Formats to [batch, channels, height, width]
-        out = self.cnn(x)
-        return out.squeeze(0)  # shape: [6, grid_size, grid_size] removes batch
+        # Use a single graph convolution layer
+        self.graph_conv = NNConv(
+            in_channels=input_dim,
+            out_channels=output_channels,
+            nn=nn_edge,
+            aggr='add'
+        )
 
+        # 6-layer 2D convolution stack to smooth predictions
+        self.conv_net = nn.Sequential(
+            nn.Conv2d(output_channels, conv_channels, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(conv_channels, output_channels, 3, padding=1)
+        )
 
-# Data Loader Function
+    def forward(self, data):
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
+        node_out = self.graph_conv(x, edge_index, edge_attr)
+        batch_size = 1
+        print("Input Statistics:", data.x.mean(), data.x.std())
+
+        # Reshape node features to 2D grid
+        node_out = node_out.view(batch_size, self.grid_size, self.grid_size, -1)
+        node_out = node_out.permute(0, 3, 1, 2).contiguous()
+
+        out = self.conv_net(node_out)
+        return out
+    
 def load_graphs(folder_path):
     graphs = []
-    for file in os.listdir(folder_path):
-        if file.endswith(".pt"):
-            graph = torch.load(os.path.join(folder_path, file), weights_only=False)
-            graphs.append(graph)
+    with safe_globals([Data]):
+        for file in os.listdir(folder_path):
+            if file.endswith(".pt"):
+                graph = torch.load(os.path.join(folder_path, file), weights_only=False)
+                if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
+                    graphs.append(graph)
     return graphs
 
-# Training
-def train_model():
-    data_folder = "/Users/aryan/Desktop/data3d_0"
-    grid_size = 100
-    device = torch.device("mps" if torch.cuda.is_available() else "cpu")
-
+def train_model(data_folder, epochs=20, batch_size=8, lr=1e-3, weight_decay=1e-5):
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    print(f"Using device: {device}")
     dataset = load_graphs(data_folder)
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    print(f"Loaded {len(dataset)} samples.")
 
+    loader = DataLoader(dataset, batch_size=1, shuffle=True)
     model = GNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.MSELoss()
 
-    epochs = 10
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0
 
         for batch in loader:
             batch = batch.to(device)
-            output = model(batch, grid_size)  # shape: [6, grid_size, grid_size]
-            target = batch.y.to(device)       # real field data
+            optimizer.zero_grad()
+            pred = model(batch)  # shape: [B, 6, 9, 9] or [6, 9, 9]
+            target = batch.y.to(device).unsqueeze(0)
 
-            loss = criterion(output, target)
+            # Extract center 5x5 from prediction
+            pred_center = pred[:, :, 2:7, 2:7]
+            loss = criterion(pred_center, target)
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
-
             total_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/{epochs} - Loss: {total_loss:.4f}")
+        avg_loss = total_loss / len(dataset)
+        print(f"Epoch {epoch}/{epochs} - Loss: {avg_loss:.6f}")
 
-    # Save model
     torch.save(model.state_dict(), "gnn_metasurface_model.pt")
-    print("Model saved.")
+    print("Model saved to gnn_metasurface_model.pt")
+    return model
 
-    return model, dataset
-
-# Visualization of E field (Real Component)
-def visualize_prediction(model, dataset, grid_size=100, sample_index=0):
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
-    data = dataset[sample_index].to(device)
-
-    with torch.no_grad():
-        pred = model(data, grid_size)
-
-    # Extract real parts: Ex, Ey, Ez (channels 0, 2, 4)
-    fields = {
-        "Ex": 0,
-        "Ey": 2,
-        "Ez": 4
-    }
-
-    fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(10, 12))
-
-    for i, (label, channel_idx) in enumerate(fields.items()):
-        true_field = data.y[channel_idx].cpu().numpy()
-        pred_field = pred[channel_idx].cpu().numpy()
-
-        axes[i, 0].imshow(true_field, cmap='viridis')
-        axes[i, 0].set_title(f"True {label}")
-
-        axes[i, 1].imshow(pred_field, cmap='viridis')
-        axes[i, 1].set_title(f"Predicted {label}")
-
-        axes[i, 0].axis('off')
-        axes[i, 1].axis('off')
-
-    plt.tight_layout()
-    plt.show()
-
-
-model, dataset = train_model()
-visualize_prediction(model, dataset, grid_size=100, sample_index=1)
+if __name__ == "__main__":
+    data_path = "data3d_0"
+    train_model(data_path, epochs=2)

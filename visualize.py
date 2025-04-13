@@ -1,51 +1,56 @@
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
+from torch_geometric.data import Data
+from torch.serialization import safe_globals
 
-# Load graph
-graph_path = "/Users/aryan/Desktop/data3d_0/data3d_0.pt"
-graph_data = torch.load(graph_path, weights_only=False)
+# Load the graph
+graph_path = "data3d_0/data3d_0_patch_4_4.pt"
+with safe_globals([Data]):
+    graph_data = torch.load(graph_path, weights_only=False)
 
-# Extract node features and edge list
-node_features = graph_data.x.numpy()          # shape: (10000, 4)
-edge_index = graph_data.edge_index.numpy()    # shape: (2, num_edges)
+node_features = graph_data.x.numpy() # shape: (81, 6)
+edge_index = graph_data.edge_index.numpy() # shape: (2, num_edges)
 
-# Get grid size (assume square)
+# Grid size from node count
 num_nodes = node_features.shape[0]
 grid_size = int(np.sqrt(num_nodes))
 
-# Use grid coordinates as positions
-node_positions = np.indices((grid_size, grid_size)).reshape(2, -1).T  # shape: (10000, 2)
+# Get normalized x and y coordinates from node features
+x_coords = node_features[:, 4] * grid_size
+y_coords = node_features[:, 5] * grid_size
 
-# Extract height values to use for color
-node_heights = node_features[:, 3]  # H is the 4th feature
+# Use height for coloring
+node_heights = node_features[:, 3]
 
-fig, ax = plt.subplots(figsize=(10, 10))
+# Plot
+fig, ax = plt.subplots(figsize=(6, 6))
 
 # Draw edges
 for i in range(edge_index.shape[1]):
-    node1, node2 = edge_index[:, i]
-    x_values = [node_positions[node1][0], node_positions[node2][0]]
-    y_values = [node_positions[node1][1], node_positions[node2][1]]
-    ax.plot(x_values, y_values, color="lightgray", alpha=0.5, linewidth=0.5)
+    source, destination = edge_index[:, i]
+    ax.plot(
+        [x_coords[source], x_coords[destination]],
+        [y_coords[source], y_coords[destination]],
+        color='lightgray', linewidth=0.5, alpha=0.6
+    )
 
-# Draw nodes with color based on height
+# Draw nodes, colored by height
 sc = ax.scatter(
-    node_positions[:, 0],
-    node_positions[:, 1],
+    x_coords, y_coords,
     c=node_heights,
     cmap="viridis",
-    s=10
+    s=30,
+    edgecolors='k'
 )
 
-# Add colorbar
-cbar = plt.colorbar(sc, ax=ax)
-cbar.set_label("Height (H)")
+# Colorbar and labels
+colorbar = plt.colorbar(sc, ax=ax)
+colorbar.set_label("Height (H)")
 
-# Plot settings
-ax.set_title("Graph Visualization (Nodes Colored by Height)")
-ax.set_xlabel("Grid X")
-ax.set_ylabel("Grid Y")
-ax.set_aspect("equal")
+ax.set_title("Metasurface Patch Graph (9x9)")
+ax.set_xlabel("X (grid units)")
+ax.set_ylabel("Y (grid units)")
+ax.set_aspect('equal')
 plt.tight_layout()
 plt.show()
