@@ -2,100 +2,156 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import NNConv
 from torch_geometric.data import Data
-import matplotlib.pyplot as plt
-from torch.serialization import safe_globals
+from torch_geometric.utils import to_dense_batch
 
-class GNN(nn.Module):
-    def __init__(self, input_dim=6, hidden_dim=64, conv_channels=64, output_channels=6, grid_size=9):
-        super(GNN, self).__init__()
-        self.grid_size = grid_size
+# ============================================
+#          MODEL: MetasurfaceGNN
+# ============================================
 
-        # used to compute edge-conditioned weight matrices for NNConv
-        nn_edge = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.ReLU(),
-            nn.Linear(64, input_dim * output_channels)
-        )
+class MetasurfaceGNN(nn.Module):
+    """
+    GNN model to predict 6-channel near-field (5x5x6) from 9x9 structural patches.
 
-        # Use a single graph convolution layer
-        self.graph_conv = NNConv(
-            in_channels=input_dim,
-            out_channels=output_channels,
-            nn=nn_edge,
+    - 1 GraphConv layer with edge  weights
+    - 6 Conv2D layers for refinement
+    """
+    def __init__(self):
+        super().__init__()
+
+        # GNN layer: (x, y, Dx, Dy, R, H)
+        self.gnn = NNConv(
+            in_channels=6,
+            out_channels=16,
+            nn=nn.Sequential(
+                nn.Linear(1, 32),
+                nn.ReLU(),
+                nn.Linear(32, 6 * 16)
+            ),
             aggr='add'
         )
 
-        # 6-layer 2D convolution stack to smooth predictions
-        self.conv_net = nn.Sequential(
-            nn.Conv2d(output_channels, conv_channels, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(conv_channels, conv_channels, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(conv_channels, output_channels, 3, padding=1)
+        # Stack of 6 Conv2D layers for output refinement
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 6, kernel_size=3, padding=1)  # Final 6 output channels
         )
 
-    def forward(self, data):
-        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
-        node_out = self.graph_conv(x, edge_index, edge_attr)
-        batch_size = 1
-        print("Input Statistics:", data.x.mean(), data.x.std())
+    def forward(self, data: Data):
+        x = self.gnn(data.x, data.edge_index, data.edge_attr)  # [81, 16]
+        x = F.relu(x)
 
-        # Reshape node features to 2D grid
-        node_out = node_out.view(batch_size, self.grid_size, self.grid_size, -1)
-        node_out = node_out.permute(0, 3, 1, 2).contiguous()
+        x, mask = to_dense_batch(x, data.batch)  # x: [batch_size, 81, 16]
+        x = x.transpose(1, 2)                    # [batch_size, 16, 81]
+        x = x.view(-1, 16, 9, 9)                 # [batch_size, 16, 9, 9]
+        x = x[:, :, 2:7, 2:7]                    # [batch_size, 16, 5, 5]
+        x = self.conv_layers(x)                  # [batch_size, 6, 5, 5]
+        return x.reshape(x.size(0), -1)          # [batch_size, 150]
 
-        out = self.conv_net(node_out)
-        return out
+# ============================================
+#              LOAD DATASET
+# ============================================
+
+def load_dataset(path="/content/drive/MyDrive/gnn_data/processed/full_dataset.pt", split=0.8):
+    """
+    Load a list of torch_geometric.data.Data objects from disk and split into train/val sets.
     
-def load_graphs(folder_path):
-    graphs = []
-    with safe_globals([Data]):
-        for file in os.listdir(folder_path):
-            if file.endswith(".pt"):
-                graph = torch.load(os.path.join(folder_path, file), weights_only=False)
-                if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
-                    graphs.append(graph)
-    return graphs
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    
+    dataset = torch.load(path, weights_only=False)
+    split_idx = int(len(dataset) * split)
+    return dataset[:split_idx], dataset[split_idx:]
 
-def train_model(data_folder, epochs=20, batch_size=8, lr=1e-3, weight_decay=1e-5):
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-    print(f"Using device: {device}")
-    dataset = load_graphs(data_folder)
-    print(f"Loaded {len(dataset)} samples.")
+# ============================================
+#              TRAINING LOOP
+# ============================================
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
-    model = GNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.MSELoss()
+def train(model, loader, optimizer, loss_fn, device):
+    model.train()
+    total_loss = 0
 
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        output = model(batch)
+        target = batch.y.view(batch.num_graphs, -1)
+        loss = loss_fn(output, target)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
 
+    return total_loss / len(loader)
+
+# ============================================
+#            VALIDATION LOOP
+# ============================================
+
+def validate(model, loader, loss_fn, device):
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            optimizer.zero_grad()
-            pred = model(batch)  # shape: [B, 6, 9, 9] or [6, 9, 9]
-            target = batch.y.to(device).unsqueeze(0)
-
-            # Extract center 5x5 from prediction
-            pred_center = pred[:, :, 2:7, 2:7]
-            loss = criterion(pred_center, target)
-            loss.backward()
-            optimizer.step()
+            output = model(batch)
+            target = batch.y.view(batch.num_graphs, -1)
+            loss = loss_fn(output, target)
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(dataset)
-        print(f"Epoch {epoch}/{epochs} - Loss: {avg_loss:.6f}")
+    return total_loss / len(loader)
 
-    torch.save(model.state_dict(), "gnn_metasurface_model.pt")
-    print("Model saved to gnn_metasurface_model.pt")
-    return model
+# ============================================
+#                  MAIN
+# ============================================
 
+def main():
+    dataset_path = "/content/full_dataset.pt"
+    model_save_path = "/content/drive/MyDrive/gnn_data/metasurface_gnn.pth"
+    epochs = 100
+    batch_size = 128
+    learning_rate = 1e-3
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load dataset and DataLoaders
+    train_data, val_data = load_dataset(dataset_path)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_data, batch_size=batch_size)
+
+    print(f"Loaded {len(train_data)} training and {len(val_data)} validation samples.")
+
+    # Initialize model and optimizer
+    model = MetasurfaceGNN().to(device)
+    loss_fn = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    # Training loop
+    for epoch in range(1, epochs + 1):
+        train_loss = train(model, train_loader, optimizer, loss_fn, device)
+        val_loss = validate(model, val_loader, loss_fn, device)
+
+        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+
+    # Save the model
+    torch.save(model.state_dict(), model_save_path)
+    print(f"\n Model saved to '{model_save_path}'")
+
+
+# Entry point
 if __name__ == "__main__":
-    data_path = "data3d_0"
-    train_model(data_path, epochs=2)
+    main()
